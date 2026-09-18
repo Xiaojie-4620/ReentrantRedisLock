@@ -331,10 +331,6 @@ rlock:v1:<resource-type>:<resource-id>
 
 对于订单、库存、余额等强一致性业务，不应将 Redis 锁作为唯一正确性保障。应同时使用数据库唯一约束、条件更新、事务、CAS 或 fencing token。
 
-### 凭据安全
-
-不要在源代码、测试文件或 README 中提交 Redis 密码。使用环境变量、密钥管理服务或本地 `.env` 文件，并将 `.env` 加入 `.gitignore`。
-
 ## 项目结构建议
 
 ```text
@@ -347,5 +343,4 @@ rlock:v1:<resource-type>:<resource-id>
 ```
 
 ## License
-
-发布前请根据项目需求添加合适的开源许可证，例如 MIT、Apache-2.0 或 BSD-3-Clause。
+This project is licensed under the [MIT License](LICENSE).
