@@ -11,7 +11,11 @@ pytestmark = pytest.mark.asyncio(loop_scope="function")
 @pytest_asyncio.fixture
 async def redis_client():
     # 使用 fakeredis 模拟异步 Redis 客户端
-    client = redis.Redis(host="47.105.65.53", port=6379, password="woshihxj", decode_responses=True)
+    client = redis.Redis(
+        host="your_redis_server_host", 
+        port=6379, 
+        password="your_redis_pwd", 
+        decode_responses=True)
     yield client
     await client.aclose()
 
