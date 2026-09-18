@@ -10,11 +10,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 """
-redis.asyncio.lock 中的 Lock 的 local 默认是线程级隔离。通常多个 asyncio Task 都运行在同一线程，因此会看到相同 token。
-应把“可重入所有者”定义为当前 Task
+An asynchronous, reentrant Redis lock with automatic lease renewal.
+
+Unlike thread-local ownership, this implementation defines the lock owner as
+the current ``asyncio.Task``. This distinction is important because many
+asyncio tasks normally run in the same operating-system thread.
 """
 
 class ReentrantRedisLock:
+    """A task-reentrant distributed lock backed by Redis.
+
+    Redis stores the lock as a hash whose field is a random owner token and
+    whose value is the reentrancy count. Lua scripts make acquire, release,
+    and renewal operations atomic. A background watchdog periodically renews
+    the key's lease while the owning task is still using the lock.
+
+    Reentrancy is limited to the same ``ReentrantRedisLock`` instance and the
+    same ``asyncio.Task``. Another task must compete for the Redis lock even if
+    it runs in the same thread.
+    """
+    
     lua_reentrant_acquire = None
     lua_reentrant_release = None
     lua_reentrant_extend = None
@@ -23,9 +38,9 @@ class ReentrantRedisLock:
     LUA_REENTRANT_ACQUIRE_SCRIPT = (
     """
     --[[
-        0：获取失败；
-        1：首次获取；
-        2：重入成功。
+        0: acquisition failed because another owner holds the lock;
+        1: the lock was acquired for the first time;
+        2: the current owner re-entered the lock.
     ]]
     local key = KEYS[1]; --- 锁的 key
     local token = ARGV[1]; --- 加锁的任务的唯一标识
@@ -54,9 +69,9 @@ class ReentrantRedisLock:
     LUA_REENTRANT_RELEASE_SCRIPT = (
     """
     --[[
-        -1: Redis 中已经不属于当前持有者；
-         0: 完全释放；
-        count: 剩余重入次数。
+       -1: the token no longer owns the Redis lock;
+         0: the lock was fully released;
+        count: the remaining reentrancy depth.
     ]]
     local key = KEYS[1];
     local token = ARGV[1];
@@ -109,11 +124,21 @@ class ReentrantRedisLock:
         renew_interval: Optional[float] = None,
         raise_on_release_error: bool = True
     ):
-        """
-        Create a new ReentrantRedisLock instance named ``name`` using the Redis client
-        supplied by ``redis``.
+        """Create a reentrant Redis lock.
 
-
+        Args:
+            redis: An initialized ``redis.asyncio.Redis`` client.
+            name: Redis key used to identify the protected resource.
+            timeout: Lease duration in seconds.
+            blocking: Whether acquisition retries while the lock is occupied.
+            blocking_timeout: Maximum blocking time in seconds, or ``None``
+                to wait indefinitely.
+            sleep: Delay between acquisition attempts, in seconds.
+            auto_renew: Whether to start the background watchdog.
+            renew_interval: Delay between normal renewal attempts. When
+                omitted, one third of ``timeout`` is used.
+            raise_on_release_error: Whether a context-manager exit should
+                propagate an ownership/release error.
         """
         if not name:
             raise ValueError("name cannot be empty")
@@ -134,7 +159,7 @@ class ReentrantRedisLock:
             timeout / 3.0 
             if renew_interval is None 
             else renew_interval
-        ) # 看门狗的时间
+        ) # Normal delay between watchdog renewal attempts.
         if not 0 < actual_renew_interval < timeout:
             raise ValueError(
                 "renew_interval must be greater than 0 and less than timeout"
@@ -142,26 +167,25 @@ class ReentrantRedisLock:
         self.renew_interval = actual_renew_interval
         self.raise_on_release_error = raise_on_release_error
 
-        # 本地协程所有权
-        self._owner_task: asyncio.Task | None = None # 判断是不是同一个 asyncio Task 重入
-        self._token: str | None = None # 在 Redis 中识别是不是同一个客户端持有者
-        self._depth = 0 # 记录本地重入层数
+        # Local ownership state. Redis remains the authoritative shared state,
+        # while these fields determine whether the current task may re-enter.
+        self._owner_task: asyncio.Task | None = None
+        self._token: str | None = None
+        self._depth = 0
         
-        # 看门狗状态
+        # Watchdog state. The event is set after ownership is known to be lost.
         self._watchdog_task: Optional[asyncio.Task] = None
         self._lock_lost = asyncio.Event()
         self._register_scripts()
 
     async def locked(self) -> bool:
         """
-        Redis 中是否持有该锁，不区分持有者
+        Return whether the Redis key is currently locked by any owner.
         """
         return bool(await self.redis.exists(self.name))
 
     async def owned(self) -> bool:
-        """
-        当前的 asyncio task 是否任然持有该锁
-        """
+       """Return whether the current task still owns the Redis lock."""
         current = asyncio.current_task()
 
         if (current is not self._owner_task or 
@@ -173,14 +197,15 @@ class ReentrantRedisLock:
 
     @property
     def lost(self) -> bool:
-        """ ensure lock is lost by local info"""
+        """Return whether this instance has detected loss of ownership."""
         return self._lock_lost.is_set()
 
     async def wait_until_lost(self) -> None:
-        """ wait watchdog ensure the lock is lost"""
+        """Wait until the watchdog or an operation detects a lost lock."""
         await self._lock_lost.wait()
 
     def _register_scripts(self) -> None:
+        """Register the atomic Lua operations with the Redis client."""
         client = self.redis
         self.lua_reentrant_acquire = client.register_script(self.LUA_REENTRANT_ACQUIRE_SCRIPT)            
         self.lua_reentrant_release = client.register_script(self.LUA_REENTRANT_RELEASE_SCRIPT)
@@ -192,19 +217,23 @@ class ReentrantRedisLock:
         blocking: Optional[bool] = None,
         blocking_timeout: Optional[float] = None,
     ) -> bool:
-        """
-        获取 Redis 可重入分布式锁。
+        """Acquire the Redis lock, re-entering it for the owning task.
 
-        重入规则：
-        1. 同一个 ReentrantRedisLock 实例；
-        2. 同一个 asyncio Task；
-        3. Redis 中仍然保存相同 token。
+        A new UUID token is generated for a normal contender. The existing
+        token is reused only when the same task re-enters this lock instance.
 
-        首次获取时生成随机 token；同一 Task 重入时复用该 token，
-        并在 Redis Hash 中增加重入计数。
+        Args:
+            blocking: Per-call override for blocking behavior.
+            blocking_timeout: Per-call maximum wait time in seconds.
 
         Returns:
-            bool: 锁是否获取成功。
+            ``True`` when acquired; ``False`` for a non-blocking failure or
+            when the blocking deadline is reached.
+
+        Raises:
+            LockNotOwnedError: Local state indicates re-entry, but the
+                previous Redis lease has already disappeared.
+            LockError: Redis reports an unexpected token collision.
         """
         current = asyncio.current_task()
         if current is None:
@@ -220,8 +249,8 @@ class ReentrantRedisLock:
                 self._token if is_reentry 
                 else uuid.uuid4().hex
             )
-
-        ttl = max(1, int(self.timeout * 1000)) # 默认10s, 使用毫秒机制
+        # Redis receives lease durations in milliseconds.
+        ttl = max(1, int(self.timeout * 1000))
         loop = asyncio.get_running_loop()
 
         deadline = (
@@ -230,7 +259,7 @@ class ReentrantRedisLock:
             else None
         )
 
-        # 阻塞模式(非阻塞模式融合到一起)
+        # The same loop handles blocking and non-blocking acquisition.
         while True:
             result = int(await self.lua_reentrant_acquire(
                 keys=[self.name],
@@ -241,8 +270,9 @@ class ReentrantRedisLock:
             if result != 0:
                 if is_reentry:
                     if result == 1:
-                        # 本地认为是重入，但 Redis 中原锁已经过期。
-                        # 获取脚本刚刚重新创建了锁，需要立即撤销。
+                        # Local state claimed this was a re-entry, but Redis
+                        # created a new lock. The previous lease was therefore
+                        # lost. Roll back the newly created lock before raising.
                         await self.lua_reentrant_release(
                             keys=[self.name],
                             args=[token, ttl],
@@ -254,17 +284,19 @@ class ReentrantRedisLock:
                             "The lock expired before reentrant acquisition",
                             lock_name=str(self.name),
                         )
-                    # result == 2，正常重入
+                     # Result 2 is a valid re-entry by the same token.
                     self._depth += 1
                     return True
                 if result != 1:
-                    # 新 UUID 理论上不应该命中旧 token
+                    # A freshly generated UUID should not match an existing
+                    # token. Treat such a response as an invariant violation.
                     raise LockError(
                         "Unexpected token collision",
                         lock_name=str(self.name),
                     )
 
-                # 首次获取成功
+                 # First acquisition: publish the local owner state and start
+                # one watchdog for the lifetime of this outermost acquisition.
                 self._owner_task = current
                 self._token = token
                 self._depth = 1
@@ -281,9 +313,9 @@ class ReentrantRedisLock:
             await asyncio.sleep(self.sleep)
 
     async def _mark_lost(self, token: str) -> None:
-        """
-        清理已经失效的本地锁状态
-            获取、释放和看门狗都可能发现锁已经过期，应该统一清理状态，避免不同方法分别修改字段。
+        """Clear local state after ownership has been proven invalid.
+        Acquisition, release, and the watchdog can all discover a lost lease.
+        Centralizing the cleanup keeps those paths consistent.
         """
         if self._token != token:
             return
@@ -297,12 +329,11 @@ class ReentrantRedisLock:
 
 
     async def release(self) -> None:
-        """
-        释放重入锁机制，调用 Lua 脚本实现原子操作来释放可重入锁
-        释放机制：
-            如果当前锁的计数大于1 说明处于重入状态，释放时检查 key 和 token 然后将重入计数 -1
-            如果当前锁的计数等于1 说明未处于重入状态，检查 key 和 token 直接删除锁
-        
+       """Release one level of ownership held by the current task.
+
+        The Lua script decrements the Redis reentrancy count. It deletes the
+        key only when the count reaches zero. A task other than the recorded
+        owner is never allowed to release this lock instance.
         """
         current = asyncio.current_task()
         if current is not self._owner_task or self._token is None:
@@ -338,9 +369,10 @@ class ReentrantRedisLock:
             await self._stop_watchdog()
 
     def _start_watchdog(self, token: str) -> None:
-        """
-        获取锁，立马启动看门狗机制
-        看门狗是独立 Task，必须捕获确定的 token，不能从“当前 Task 所有权”推导 token。
+        """Start one background renewal task for the captured owner token.
+
+        The watchdog is a different asyncio task from the lock owner, so it
+        must use the captured token instead of task-ownership checks.
         """
         if not self.auto_renew:
             return
@@ -354,8 +386,10 @@ class ReentrantRedisLock:
         )
 
     async def _watchdog(self, token: str) -> None:
-        """
-        看门狗机制，后台任务，只要当前锁的还剩 1/3 且锁未释放，就自动续期
+        """Renew the lease until release, cancellation, or ownership loss.
+
+        Normal renewals use ``renew_interval``. After a Redis error, retries
+        use a shorter delay bounded by the estimated remaining lease time.
         """
         loop = asyncio.get_running_loop()
         lease_deadline = loop.time() + self.timeout
@@ -401,9 +435,7 @@ class ReentrantRedisLock:
                 self._watchdog_task = None
 
     async def _extend_token(self, token: str) -> bool:
-        """
-        内部看门狗使用的续期方法
-        """
+        """Renew a lease for an explicit token without task-owner checks."""
         ttl = max(1, int(self.timeout * 1000)) 
 
         resp = await self.lua_reentrant_extend(
@@ -415,9 +447,7 @@ class ReentrantRedisLock:
         return bool(resp)
 
     async def renew(self) -> bool:
-        """
-        调用 Lua 脚本，原子实现锁的续期
-        """
+        """Manually renew the lease from the owning application task."""
         current = asyncio.current_task()
         if current is not self._owner_task or self._token is None:
             raise LockError(
@@ -439,9 +469,8 @@ class ReentrantRedisLock:
         return True
 
     async def _stop_watchdog(self) -> None:
-        """
-        锁释放后，也要终止看门狗的后台任务
-        """
+        """Cancel and await the watchdog without ever awaiting itself."""
+        
         task, self._watchdog_task = self._watchdog_task, None
         current = asyncio.current_task()
         # 关键：不能在 watchog 自己里 await 自己，会死锁
@@ -452,7 +481,7 @@ class ReentrantRedisLock:
             except asyncio.CancelledError:
                 pass
 
-    # 上下文管理器
+    # Async context-manager support allows nested ``async with lock`` blocks.
     async def __aenter__(self) -> "ReentrantRedisLock":
         acquired = await self.acquire()
         if not acquired:
@@ -463,7 +492,6 @@ class ReentrantRedisLock:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        # 释放异常会链到原有异常上
         try:
             await self.release()
         except LockError:
